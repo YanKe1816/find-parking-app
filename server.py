@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""FastAPI MCP-style server for deterministic parking lookup."""
+"""Minimal deterministic MCP server for find parking."""
 
 from __future__ import annotations
 
+import json
+import sys
 from typing import Any
-
-import uvicorn
-from fastapi import FastAPI
-from pydantic import BaseModel
 
 TOOL_NAME = "find_parking"
 
+# Deterministic, static dataset keyed by normalized location.
 PARKING_DATA: dict[str, list[dict[str, Any]]] = {
     "downtown": [
         {
@@ -46,31 +45,25 @@ PARKING_DATA: dict[str, list[dict[str, Any]]] = {
 
 TOOL_SCHEMA = {
     "name": TOOL_NAME,
-    "input": {
+    "description": "Return deterministic parking places for a location.",
+    "inputSchema": {
         "type": "object",
-        "properties": {
-            "location": {"type": "string"},
-        },
+        "properties": {"location": {"type": "string"}},
         "required": ["location"],
-    },
-    "output": {
-        "places": [
-            {
-                "name": "string",
-                "address": "string",
-                "lat": 0,
-                "lng": 0,
-            }
-        ]
     },
 }
 
-app = FastAPI()
+
+def make_result(payload: Any, request_id: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": payload}
 
 
-class ToolCallRequest(BaseModel):
-    name: str
-    arguments: dict[str, Any] = {}
+def make_error(code: int, message: str, request_id: Any) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": code, "message": message},
+    }
 
 
 def find_parking(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -79,25 +72,57 @@ def find_parking(arguments: dict[str, Any]) -> dict[str, Any]:
         return {"places": []}
 
     normalized = location.strip().lower()
-    return {"places": PARKING_DATA.get(normalized, [])}
+    places = PARKING_DATA.get(normalized, [])
+    return {"places": places}
 
 
-@app.get("/")
-def root() -> dict[str, str]:
-    return {"status": "ok"}
+def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
+    request_id = request.get("id")
+    method = request.get("method")
+    params = request.get("params") or {}
+
+    if method == "tools/list":
+        return make_result({"tools": [TOOL_SCHEMA]}, request_id)
+
+    if method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if name != TOOL_NAME:
+            return make_result({"places": []}, request_id)
+        return make_result(find_parking(arguments), request_id)
+
+    if method in {"health", "health/check"}:
+        return make_result({"status": "ok"}, request_id)
+
+    if request_id is None:
+        return None
+    return make_error(-32601, "Method not found", request_id)
 
 
-@app.get("/tools/list")
-def tools_list() -> dict[str, list[dict[str, Any]]]:
-    return {"tools": [TOOL_SCHEMA]}
+def main() -> int:
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            sys.stdout.write(json.dumps(make_error(-32700, "Parse error", None)) + "\n")
+            sys.stdout.flush()
+            continue
 
+        if not isinstance(request, dict):
+            sys.stdout.write(json.dumps(make_error(-32600, "Invalid Request", None)) + "\n")
+            sys.stdout.flush()
+            continue
 
-@app.post("/tools/call")
-def tools_call(payload: ToolCallRequest) -> dict[str, Any]:
-    if payload.name != TOOL_NAME:
-        return {"places": []}
-    return find_parking(payload.arguments)
+        response = handle_request(request)
+        if response is not None:
+            sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+    return 0
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    raise SystemExit(main())
